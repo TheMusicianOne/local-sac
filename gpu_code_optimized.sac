@@ -454,10 +454,10 @@ int main(){
       pixels = next;
       mask = reseed_mask(mask,batch_size,field_size,field_size);
 
-      /*if(i%100 == 0){
+      if(i%100 == 0){
           ok = visualize(pixels,cid2kind,field_size,i);
           print(ok);
-      }*/
+      }
     }
               ok = visualize(pixels,cid2kind,field_size,i);
           print(ok);

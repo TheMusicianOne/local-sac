@@ -26,7 +26,7 @@ int write_ppm_iter(unsigned char *base_cstr, SACarg *sa_labels, int iter)
   size_t h = SACARGgetShape(sa_labels, 1);  // y-dimension (height)
   const int *lab = SACARGgetSharedData(SACTYPE__MAIN__int, sa_labels);
 
-  const char *outdir = "frames/final_frames";
+  const char *outdir = "./";
   if (ensure_dir(outdir) != 0) {
     fprintf(stderr, "[write_ppm_iter] mkdir %s failed: %s\n", outdir, strerror(errno));
     return 0;
