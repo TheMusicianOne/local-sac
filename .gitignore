@@ -1,0 +1,6 @@
+frames/
+Stdlib/
+sac_tutorial.pdf
+*.o
+*.ii
+*.h

@@ -1,0 +1,518 @@
+use StdIO : all;
+use Array : all;
+use Math : all;
+use Benchmarking: all;
+
+#ifndef FS
+#define FS 512
+#endif
+#ifndef BS
+#define BS 1
+#endif
+#ifndef NC
+#define NC 2368
+#endif
+#ifndef NCPO
+#define NCPO 2369
+#endif
+#ifndef NK
+#define NK 2
+#endif
+#ifndef NKPO
+#define NKPO 3
+#endif
+
+external int [BS,FS,FS] load_field3d_from_npy(
+    int[BS,FS,FS] field,
+    int bs,int fs,
+    char[2] filename
+);
+#pragma gpumem [0,1]
+#pragma linksign [1,1,2,3,4]
+#pragma linkobj "get_npy_pixels.o"
+
+
+external int [BS,NCPO] load_field_from_npy(
+    int[BS,NCPO] field,
+    int bs,int fs,int nc,
+    char[2] filename
+);
+#pragma gpumem [0,1]
+#pragma linksign [1,1,2,3,4,5]
+#pragma linkobj "get_npy.o"
+
+external float[BS,FS,FS,3] reseed_mask(
+  float[BS,FS,FS,3] mask,
+  int nb, int sy, int sx, int seed
+);
+# pragma gpumem  [0,1]
+# pragma linksign [1,1,2,3,4,5]
+# pragma linkobj "reseed_mask.o"
+
+#if 0
+inline int wrap(int i, int n) { return (i < 0) ? wrap((i+n),n) : (i >= n ? i-n : i); }
+#else
+inline int wrap(int i, int n) { return _aplmod_SxS_(i,n); }
+#endif
+
+inline
+int[nb,sy,sx], int[nb,nc], int[nb,nc] seed_cells_in_circle(
+  int[nb,sy,sx] pixels,
+  int[nb,nc] cid2kind,
+  int[nb,nc] volumes,
+  int radius,
+  int num_cells_kind1,
+  int num_cells_kind2,
+  int seed
+)
+{
+  nb = shape(pixels)[0];
+  field_size = shape(pixels)[1];
+  center = field_size / 2;
+  
+  // Seed cells for all batches
+  p, c, v = seed_batch_recursive(pixels, cid2kind, volumes, 
+                                 0, nb, field_size, center, radius,
+                                 num_cells_kind1, num_cells_kind2, seed);
+  return (p, c, v);
+}
+
+int[BS,FS,FS], int[BS,NCPO], int[BS,NCPO] seed_batch_recursive(
+  int[BS,FS,FS] pixels,
+  int[BS,NCPO] cid2kind,
+  int[BS,NCPO] volumes,
+  int current_batch,
+  int nb,
+  int field_size,
+  int center,
+  int radius,
+  int num_cells_kind1,
+  int num_cells_kind2,
+  int seed
+)
+{
+  if (current_batch >= nb) {
+    // Base case: all batches done
+    result_pixels = pixels;
+    result_cid2kind = cid2kind;
+    result_volumes = volumes;
+  } else {
+    // Seed cells for current batch
+    pixels_tmp, cid2kind_tmp, volumes_tmp = 
+      seed_single_batch(pixels, cid2kind, volumes,
+                       current_batch, field_size, center, radius,
+                       num_cells_kind1, num_cells_kind2, seed);
+    
+    // Recurse to next batch
+    result_pixels, result_cid2kind, result_volumes = 
+      seed_batch_recursive(pixels_tmp, cid2kind_tmp, volumes_tmp,
+                          current_batch + 1, nb, field_size, center, radius,
+                          num_cells_kind1, num_cells_kind2, seed);
+  }
+  
+  return (result_pixels, result_cid2kind, result_volumes);
+}
+
+inline
+int[nb,sy,sx], int[nb,nc], int[nb,nc] seed_single_batch(
+  int[nb,sy,sx] pixels,
+  int[nb,nc] cid2kind,
+  int[nb,nc] volumes,
+  int batch_idx,
+  int field_size,
+  int center,
+  int radius,
+  int num_cells_kind1,
+  int num_cells_kind2,
+  int seed
+)
+{
+  total_cells = num_cells_kind1 + num_cells_kind2;
+  max_attempts = total_cells * 50;
+  
+  // Try to seed cells by generating random positions
+  p, c, v = try_seed_cells(pixels, cid2kind, volumes,
+                          batch_idx, field_size, center, radius,
+                          num_cells_kind1, num_cells_kind2,
+                          0, 0, 0, max_attempts, seed);
+  return (p, c, v);
+}
+
+inline
+int[nb,sy,sx], int[nb,nc], int[nb,nc] try_seed_cells(
+  int[nb,sy,sx] pixels,
+  int[nb,nc] cid2kind,
+  int[nb,nc] volumes,
+  int batch_idx,
+  int field_size,
+  int center,
+  int radius,
+  int num_cells_kind1,
+  int num_cells_kind2,
+  int cells_seeded,
+  int next_cell_id,
+  int attempt,
+  int max_attempts,
+  int seed
+)
+{
+  total_cells = num_cells_kind1 + num_cells_kind2;
+  
+  if (cells_seeded >= total_cells || attempt >= max_attempts) {
+    // Done seeding this batch
+    result_pixels = pixels;
+    result_cid2kind = cid2kind;
+    result_volumes = volumes;
+  } else {
+    // Generate random position
+    rand_y_val = rand_from_indices(batch_idx, attempt, 0, 0, seed);
+    rand_x_val = rand_from_indices(batch_idx, attempt, 1, 0, seed + 1);
+    
+    y = toi(rand_y_val * tof(field_size)) % field_size;
+    x = toi(rand_x_val * tof(field_size)) % field_size;
+    
+    // Check if in circle
+    dy = y - center;
+    dx = x - center;
+    dist_sq = dy*dy + dx*dx;
+    in_circle = dist_sq < radius*radius;
+    is_empty = pixels[batch_idx, y, x] == 0;
+    
+    if (in_circle && is_empty) {
+      // Valid position - place cell
+      cell_id = next_cell_id + 1;
+      kind = (cells_seeded < num_cells_kind1) ? 1 : 2;
+      
+      // Update arrays
+      pixels_new = modarray(pixels, [batch_idx, y, x], cell_id);
+      cid2kind_new = modarray(cid2kind, [batch_idx, cell_id], kind);
+      volumes_new = modarray(volumes, [batch_idx, cell_id], 1);
+      
+      // Recurse with updated state
+      result_pixels, result_cid2kind, result_volumes = 
+        try_seed_cells(pixels_new, cid2kind_new, volumes_new,
+                      batch_idx, field_size, center, radius,
+                      num_cells_kind1, num_cells_kind2,
+                      cells_seeded + 1, cell_id, attempt + 1, max_attempts, seed);
+    } else {
+      // Invalid position - try next
+      result_pixels, result_cid2kind, result_volumes = 
+        try_seed_cells(pixels, cid2kind, volumes,
+                      batch_idx, field_size, center, radius,
+                      num_cells_kind1, num_cells_kind2,
+                      cells_seeded, next_cell_id, attempt + 1, max_attempts, seed);
+    }
+  }
+  
+  return (result_pixels, result_cid2kind, result_volumes);
+}
+
+external int write_ppm_iter(char[*] base, int[sy,sx] arr, int iter);
+# pragma sacarg [2] // 2nd param is also index 2 since 0 is returned data.
+# pragma header "sac_ppm.h"
+# pragma linkobj "sac_ppm.o"
+
+// GPU version: returns an [nb,nc] delta computed from device-resident pixels/next
+
+external int[BS,NCPO] volumes_update(
+  int[BS,FS,FS] pixels,    // device
+  int[BS,FS,FS] next,      // device
+  int[BS,NCPO]    out,       // device (destination)
+  int nb, int sy, int sx, int nc
+);
+# pragma gpumem  [0,1,2,3]   // return, pixels, next, out live on GPU
+# pragma linksign [3,1,2,3,4,5,6,7]
+# pragma linkobj  "volumes_update.o"
+
+/*
+int[nb,nc] volumes_update(
+  int[nb,sy,sx] pixels, int[nb,sy,sx] next, int[nb,nc] out,
+  int nb, int sy, int sx, int nc
+){
+  // CPU fallback (optional): write into out and return it
+  return with {
+    ([0,0] <= [b,c] < [nb,nc]) {
+      d = with {
+        ([0,0] <= [y,x] < [sy,sx]) {
+          old = pixels[b,y,x];
+          neu = next[b,y,x];
+          z = 0; if (old==c) z -= 1; if (neu==c) z += 1;
+        } : z;
+      } : fold(+, 0);
+    } : d;
+  } : out;
+}
+*/
+
+
+
+
+
+inline float rand_from_indices(int b, int y, int x, int t, int seed)
+{
+  fb = tof(b);
+  fy = tof(y);
+  fx = tof(x);
+  ft = tof(t);
+  fs = tof(seed);
+
+  // Mix all indices into a single float
+  s = fb * 12.9898f
+    + fy * 78.233f
+    + fx * 37.719f
+    + ft * 11.53f
+    + fs * 0.1234f;
+
+  r = sin(s) * 43758.5453f;  // chaotic but deterministic
+  r = r - floor(r);          // r in [0,1)
+
+  return r;
+}
+
+float[nb,sy,sx,3] setmask_seeded(float[nb,sy,sx,3] mask, int seed)
+{
+  result = with
+  {
+    ([0,0,0,0] <= [b,y,x,t] < [nb,sy,sx,3])
+    {
+      rand_val = rand_from_indices(b,y,x,t,seed);
+    }: rand_val;
+  }: genarray(shape(mask), 1f);
+  return result;
+}
+// I followed the adhesion template on simplified standalone
+float delta_h_adh(
+  int tgt,
+  int tgt_kind,
+  int src,
+  int src_kind,
+  int[8] neigh,
+  int[8] nkind,
+  int[nb,nc,nc] J,
+  int b
+)
+{
+  adh_per_neigh = with
+  {
+    ([0] <= i < [8])
+    {
+      d = 0f;
+      nc = neigh[i];
+      nk = nkind[i];
+
+      if (nc != src){
+        d += tof(J[b,src_kind,nk]);
+      }
+
+      if (nc != tgt){
+        d -= tof(J[b,tgt_kind,nk]);
+      }
+    }:d;
+  }:genarray(shape(neigh),0f);
+
+
+  return sum(adh_per_neigh);
+}
+
+
+inline float delta_h_vol(
+  int tgt,
+  int tgt_kind,
+  int selfvol,
+  int self_lambda_vol,
+  int self_tgt_vol,
+
+  int src,
+  int src_kind,
+  int srcvol,
+  int src_lambda_vol,
+  int src_tgt_vol
+  )
+{
+  t_delta_h_vol = 0f;
+  s_delta_h_vol = 0f;
+  if (tgt != 0){
+    bt = (selfvol - 1) - self_tgt_vol;
+    b0 = selfvol - self_tgt_vol;
+    t_delta_h_vol = tof(self_lambda_vol * (bt*bt - b0*b0));
+  }
+
+  if (src != 0){
+    bs = (srcvol + 1) - src_tgt_vol;
+    b0 = srcvol - src_tgt_vol;
+    s_delta_h_vol = tof(src_lambda_vol * (bs*bs - b0*b0));
+  }
+
+  return (t_delta_h_vol + s_delta_h_vol);
+}
+
+
+
+inline
+int [nb,sy,sx] mcs_step(
+  int [nb,sy,sx] pixels,
+  float [nb,sy,sx,3] mask,
+  int [nb,nc] cid2kind,
+  int [nb,nk,nk] J,
+  int [nb,nc] volumes,
+  int [nb,nk] tgt_vol,
+  int [nb,nk] lambda_vol,
+  float [nb] T
+)
+{
+  dx = [-1,-1,-1, 0, 0, 1, 1, 1];
+  dy = [-1, 0, 1,-1, 1,-1, 0, 1];
+  next = with
+    {
+      ([0,0,0] <= [b,y,x] < shape(pixels)){
+
+
+        selfrandom = mask[b,y,x,1];
+        selfrandom0 = mask[b,y,x,0];
+        selfmask = mask[b,y,x,2];
+        
+
+        tgt = pixels[b,y,x];
+        tgt_kind = cid2kind[b,tgt];
+
+        raw_pos    = toi(selfrandom0 * 8f);    // 0..8
+        source_pos = raw_pos;
+        if (source_pos < 0)  { source_pos = 0; }
+        if (source_pos > 7)  { source_pos = 7; }
+        ny = wrap(y+dy[source_pos],sy);
+        nx = wrap(x+dx[source_pos],sx);
+
+        src = pixels[b,ny,nx];
+        src_kind = cid2kind[b,src];
+        
+        selfvol = volumes[b,tgt];
+        self_lambda_vol = lambda_vol[b,tgt_kind];
+        self_tgt_vol = tgt_vol[b,tgt_kind];
+
+        srcvol = volumes[b,src];
+        src_lambda_vol = lambda_vol[b,src_kind];
+        src_tgt_vol = tgt_vol[b,src_kind];
+          neigh_adh = with
+            {
+                ([0] <= i < [8])
+                {
+                d = 0f;
+                ny = wrap(y + dy[i], sy);
+                nx = wrap(x + dx[i], sx);
+                nc = pixels[b, ny, nx];
+                nk = cid2kind[b, nc];
+
+                if (nc != src){
+                    d += tof(J[b,src_kind,nk]);
+                }
+
+                if (nc != tgt){
+                    d -= tof(J[b,tgt_kind,nk]);
+                }
+                }:d;
+            }:genarray([8],0f);
+        dadh = sum(neigh_adh);
+        dvol = delta_h_vol(tgt,tgt_kind,selfvol,self_lambda_vol,self_tgt_vol,src,src_kind,srcvol,src_lambda_vol,src_tgt_vol);
+
+        dh = dadh + dvol;
+        n_larger_than = with
+        {
+          ([0] <= i < [8])
+          {
+            ny_check = wrap(y+dy[i], sy);
+            nx_check = wrap(x+dx[i], sx);
+            neigh_mask = mask[b, ny_check, nx_check, 2];
+          }: (neigh_mask < selfmask) ? 1 : 0;
+        }:genarray([8],0);
+        
+        won_lottery = sum(n_larger_than) == 8;
+
+        accept = won_lottery && (src!= tgt) && (dh <= 0f || selfrandom < exp(-dh / (T[b] + 1e-12f)));
+    }: (accept ? src : tgt);
+
+    }: modarray(pixels);
+
+  return next;
+}
+
+int visualize(
+  int[nb,sy,sx] pixels,
+  int [nb,nc] cid2kind,
+  int field_size,
+  int iter
+){
+  // After seeding, create a visualization array with kinds instead of IDs
+  base = ['f','r','a','m','e','\0'];         // char[*], not "frame"
+  pixels_for_vis = with
+  {
+    ([0,0] <= [y,x] < [field_size, field_size])
+    {
+      cell_id = pixels[0, y, x];  // Get cell ID at this position
+      kind = cid2kind[0, cell_id]; // Look up its kind
+    }: kind;
+  }: genarray([field_size, field_size], 0);
+
+  ok = write_ppm_iter(base, pixels_for_vis, iter);
+  return ok;
+}
+
+int main(){
+  field_size=FS; batch_size = BS;
+  num_cells = NC; cell_kinds = NK;
+
+
+  pixels = with {} : genarray([batch_size,field_size,field_size],0);
+  next = with {} : genarray([batch_size,field_size,field_size],0);
+  mask = with {} : genarray([batch_size,field_size,field_size,3],0f);
+  cid2kind = with {} : genarray([batch_size,num_cells+1],0);
+  volumes = with {} : genarray([batch_size,num_cells+1],0);
+  vol_delta = with {} : genarray([batch_size,num_cells+1],0);
+  
+  J = with {} : genarray([batch_size,cell_kinds+1,cell_kinds+1],0);
+  tgt_vol = with {} : genarray([batch_size,cell_kinds+1],0);
+  lambda_vol = with {} : genarray([batch_size,cell_kinds+1],0);
+  T = with {} : genarray([batch_size],10f);
+
+  pixels = load_field3d_from_npy(pixels,BS,FS,['p','\0']);
+  volumes = load_field_from_npy(volumes,BS,FS,NCPO,['v','\0']);
+  cid2kind = load_field_from_npy(cid2kind,BS,FS,NCPO,['c','\0']);
+
+  J_base= [
+        [0,  16,  16],
+        [16,  2,  11],
+        [16, 11, 2]
+        ];
+  J = with {} : genarray([batch_size], J_base);
+
+  tgt_vol_base = [
+    0,40,40
+  ];
+  tgt_vol = with {} : genarray([batch_size],tgt_vol_base);
+
+  lambda_vol_base = [0,3,3];
+  lambda_vol = with {} : genarray([batch_size],lambda_vol_base);
+
+  mask = reseed_mask(mask,batch_size,field_size,field_size,0);
+  bi = getInterval (0);
+
+  start (bi);
+    for(i =1;i<=30000;i++){
+      next      = mcs_step(pixels,mask,cid2kind,J,volumes,tgt_vol,lambda_vol,T);
+      vol_delta = volumes_update(pixels, next, vol_delta,batch_size,field_size,field_size,num_cells+1);
+      volumes  += vol_delta;
+      pixels    = next;
+      mask      = reseed_mask(mask,batch_size,field_size,field_size,i);
+
+#ifdef PRINT
+      if(i%100 == 0){
+          ok = visualize(pixels,cid2kind,field_size,i);
+          print(ok);
+      }
+#endif
+    }
+  end (bi);
+  printResult (bi);
+  ok = visualize(pixels,cid2kind,field_size,30001);
+
+  return toi(ok);
+}
